@@ -108,12 +108,12 @@ class ModelMarsMoon(nn.Module):
         self.output_conv = nn.Conv2d(32, 2, kernel_size=5, padding=2)
 
     def forward(self, x):
-        x = F.leaky_relu(self.initial_conv(x))
+        x = F.leaky_relu(self.initial_conv(x), negative_slope=0.3)
         for conv1, conv2 in self.res_convs:
             residual = x
-            x = F.leaky_relu(conv1(x))
+            x = F.leaky_relu(conv1(x), negative_slope=0.3)
             x = conv2(x)
-            x = F.leaky_relu(x + residual)
+            x = F.leaky_relu(x + residual, negative_slope=0.3)
         x = self.output_conv(x)
         return x
 

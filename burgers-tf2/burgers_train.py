@@ -118,12 +118,12 @@ class ModelMarsMoon(nn.Module):
         self.output_conv = nn.Conv2d(32, 2, kernel_size=5, padding=2)
 
     def forward(self, x):
-        x = F.leaky_relu(self.initial_conv(x))
+        x = F.leaky_relu(self.initial_conv(x), negative_slope=0.3)
         for conv1, conv2 in self.res_convs:
             residual = x
-            x = F.leaky_relu(conv1(x))
+            x = F.leaky_relu(conv1(x), negative_slope=0.3)
             x = conv2(x)
-            x = F.leaky_relu(x + residual)
+            x = F.leaky_relu(x + residual, negative_slope=0.3)
         return self.output_conv(x)
 
 def downsample4xSMAC(tensor):
@@ -518,7 +518,6 @@ for j in range(params['epochs']):  # training
                 diff_loss_total = diff_loss_total + step_loss
 
                 # Update state for next multi-step
-                correction_np = model_out_padded.detach().cpu().numpy()
                 correction_sg = to_staggered(model_out_denorm.detach().cpu().numpy(), box=st_co.velocity.box)
                 st_co_curr = pred.copied_with(velocity=pred.velocity + correction_sg)
 
