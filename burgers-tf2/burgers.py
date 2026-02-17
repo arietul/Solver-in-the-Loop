@@ -7,7 +7,7 @@
 # Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Data generation
+# Data generation (PyTorch version)
 #
 # ----------------------------------------------------------------------------
 
@@ -42,8 +42,8 @@ parser.add_argument('-t', '--simsteps',  default=200, type=int,   help='simulati
 parser.add_argument('-r', '--res',       default=32, type=int,    help='resolution of the reference axis')
 parser.add_argument('-l', '--len',       default=32, type=int,    help='length of the reference axis')
 parser.add_argument('--dt',              default=0.1, type=float, help='simulation time step size')
-parser.add_argument('--initvH',          default=None,            help='load hires (will be downsampled) velocity (e.g., velo_0000.npz)')
-parser.add_argument('--loadfH',          default=None,            help='load hires (will be downsampled) force files (will be passed to glob) (e.g., "sim_000000/forc_0*.npz")')
+parser.add_argument('--initvH',         default=None,            help='load hires (will be downsampled) velocity (e.g., velo_0000.npz)')
+parser.add_argument('--loadfH',         default=None,            help='load hires (will be downsampled) force files (will be passed to glob) (e.g., "sim_000000/forc_0*.npz")')
 parser.add_argument('-d', '--scale',     default=4, type=int,     help='down-sampling scale of hires (only valid when initvH given)')
 parser.add_argument('--seed',            default=0, type=int,     help='seed for random number generator')
 sys.argv += ['--' + p for p in params if isinstance(params[p], bool) and params[p]]
@@ -52,18 +52,15 @@ params.update(vars(pargs))
 
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
-if params['cuda']: from phi.tf.tf_cuda_pressuresolver import CUDASolver
+import torch
 
-from phi.tf.flow import *
-from tensorflow import keras
-
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
-tf_session = tf.Session(config=config)
+from phi.flow import *
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.compat.v1.set_random_seed(params['seed'])
+torch.manual_seed(params['seed'])
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def downsample4xSMAC(tensor):
     return StaggeredGrid(tensor).downsample2x().downsample2x().staggered_tensor()
@@ -130,25 +127,15 @@ if fc_files:
 # phiflow scene
 
 scene = Scene.create(directory=params['output'])
-sess  = Session(scene, session=tf_session)
 
 log.addHandler(logging.FileHandler(os.path.normpath(scene.path)+'/run.log'))
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
 if params['output']:
     with open(os.path.normpath(scene.path)+'/params.pickle', 'wb') as f: pickle.dump(params, f)
 
 simulator = BurgersTest()
-
-tf_st_in = placeholder(st.shape)
-tf_fc_in = placeholder(fc.shape)
-tf_st = simulator.step_with_f(v=tf_st_in, f=tf_fc_in, dt=params['dt']) if not params['noforce'] else simulator.step(v=tf_st_in, dt=params['dt'])
-tf_fc = tf_fc_in
-
-if fc_files is None:            # for regular sim with randomization forces
-    tf_fcs_in = placeholder_like(forces)
-    tf_fcs = [ physics.step(force, dt=params['dt']) for force, physics in zip(tf_fcs_in, force_physics) ]
 
 if params['skipsteps']==0 and params['output'] is not None:
     scene.write(
@@ -164,13 +151,14 @@ if params['skipsteps']==0 and params['output'] is not None:
         save_img(fc.velocity.data[1].data, 100000., thumb_path + "/frcU_{:06d}.png".format(0))
         save_img(fc.velocity.data[0].data, 100000., thumb_path + "/frcV_{:06d}.png".format(0))
 
-sess.initialize_variables()
 for i in range(1, max(params['simsteps']+params['skipsteps'], 1)):
-    my_feed_dict = { tf_st_in: st, tf_fc_in: fc }
-    st, fc = sess.run([tf_st, tf_fc], my_feed_dict)
+    if not params['noforce']:
+        st = simulator.step_with_f(v=st, f=fc, dt=params['dt'])
+    else:
+        st = simulator.step(v=st, dt=params['dt'])
 
     if fc_files is None:
-        forces = sess.run(tf_fcs, {atf_fc_in: force for atf_fc_in, force in zip(tf_fcs_in, forces)})
+        forces = [physics.step(force, dt=params['dt']) for force, physics in zip(forces, force_physics)]
         fc = fc.copied_with(velocity=sum([force.field for force in forces]).at(dm.staggered_grid(0)))
 
     else:

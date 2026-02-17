@@ -33,7 +33,7 @@ def save_img(array, scale, name, idx=0):
 params = {}
 parser = argparse.ArgumentParser(description='Parameter Parser', formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument('--gpu',             default='0',             help='visible GPUs')
-parser.add_argument('--cuda',            action='store_true',     help='enable CUDA for solver')
+parser.add_argument('--cuda',           action='store_true',     help='enable CUDA for solver')
 parser.add_argument('-o', '--output',    default=None,            help='path to an output directory')
 parser.add_argument('--thumb',           action='store_true',     help='save thumbnail images')
 parser.add_argument('-t', '--simsteps',  default=1500, type=int,  help='simulation steps: an epoch')
@@ -51,17 +51,13 @@ params.update(vars(pargs))
 
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
-if params['cuda']: from phi.tf.tf_cuda_pressuresolver import CUDASolver
+from phi.flow import *
 
-from phi.tf.flow import *
-import phi.tf.util
-
-import tensorflow as tf
-from tensorflow import keras
+import torch
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.compat.v1.set_random_seed(params['seed'])
+torch.manual_seed(params['seed'])
 
 def downsample4x(tensor):
     return math.downsample2x(math.downsample2x(tensor))
@@ -121,23 +117,16 @@ velBCyMask = np.copy(vn)        # warning, only works for 1s, otherwise setup/sc
 
 # phiflow scene
 
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
-tf_session = tf.Session(config=config)
-
 scene = Scene.create(directory=params['output'])
-sess  = Session(scene, session=tf_session)
 
 log.addHandler(logging.FileHandler(os.path.normpath(scene.path)+'/run.log'))
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
 if params['output']:
     with open(os.path.normpath(scene.path)+'/params.pickle', 'wb') as f: pickle.dump(params, f)
 
 simulator = KarmanFlow()
-tf_st_in = phi.tf.util.placeholder_like(st)
-tf_st = simulator.step(tf_st_in, re=params['re'], res=params['res'], velBCy=velBCy, velBCyMask=velBCyMask)
 
 if params['skipsteps']==0 and params['output'] is not None:
     scene.write(
@@ -147,8 +136,7 @@ if params['skipsteps']==0 and params['output'] is not None:
     )
 
 for i in range(1, params['simsteps']):
-    my_feed_dict = { tf_st_in: st }
-    st = sess.run(tf_st, my_feed_dict)
+    st = simulator.step(st, re=params['re'], res=params['res'], velBCy=velBCy, velBCyMask=velBCyMask)
 
     log.info('Step {:06d}'.format(i))
     if params['skipsteps']<i and params['output'] is not None:

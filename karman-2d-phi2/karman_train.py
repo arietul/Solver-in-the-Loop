@@ -40,9 +40,9 @@ parser.add_argument('--lr',             default=1e-3, type=float,  help='start l
 parser.add_argument('--adplr',          action='store_true',       help='turn on adaptive learning rate')
 parser.add_argument('--clip-grad',      action='store_true',       help='turn on clip gradients')
 parser.add_argument('--resume',         default=-1, type=int,      help='resume training epochs')
-parser.add_argument('--inittf',         default=None,              help='load initial model weights (warm start)')
-parser.add_argument('--pretf',          default=None,              help='load pre-trained weights (only for testing pre-trained supervised model; do not use for a warm start!)')
-parser.add_argument('--tf',             default='/tmp/phiflow/tf', help='path to a tensorflow output dir (model, logs, etc.)')
+parser.add_argument('--initpt',         default=None,              help='load initial model weights (warm start)')
+parser.add_argument('--prept',          default=None,              help='load pre-trained weights (only for testing pre-trained supervised model; do not use for a warm start!)')
+parser.add_argument('--pt',             default='/tmp/phiflow/pt', help='path to a pytorch output dir (model, logs, etc.)')
 sys.argv += ['--' + p for p in params if isinstance(params[p], bool) and params[p]]
 pargs = parser.parse_args()
 params.update(vars(pargs))
@@ -50,19 +50,22 @@ params.update(vars(pargs))
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
 from phi.physics._boundaries import Domain, OPEN, STICKY as CLOSED
-from phi.tf.flow import *
+from phi.torch.flow import *
 
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True)
-    logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-    log.info('{} Physical GPUs {} Logical GPUs'.format(len(gpus), len(logical_gpus)))
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from tensorflow import keras
+if torch.cuda.is_available():
+    gpu_count = torch.cuda.device_count()
+    log.info('{} GPUs available'.format(gpu_count))
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.random.set_seed(params['seed'])
+torch.manual_seed(params['seed'])
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(params['seed'])
 
 if params['resume']>0 and params['log']:
     params['log'] = os.path.splitext(params['log'])[0] + '_resume{:04d}'.format(params['resume']) + os.path.splitext(params['log'])[1]
@@ -76,55 +79,43 @@ if (params['nsims'] % params['sbatch']) != 0:
     log.info('Number of simulations is not divided by the batch size thus adjusted to {}'.format(params['nsims']))
 
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
-def model_mercury(inputs_dict):
-    with tf.name_scope('model_mercury') as scope:
-        return keras.Sequential([
-            keras.layers.Input(**inputs_dict),
-            keras.layers.Conv2D(filters=32, kernel_size=5, padding='same', activation=tf.nn.relu),
-            keras.layers.Conv2D(filters=64, kernel_size=5, padding='same', activation=tf.nn.relu),
-            keras.layers.Conv2D(filters=2,  kernel_size=5, padding='same', activation=None), # u, v
-        ], name='mercury')
+class ModelMercury(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv2d(64, 2, kernel_size=5, padding=2)
 
-def model_mars_moon(inputs_dict):
-    with tf.name_scope('model_mars_moon') as scope:
-        l_input = keras.layers.Input(**inputs_dict)
-        block_0 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_input)
-        block_0 = keras.layers.LeakyReLU()(block_0)
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        x = self.conv3(x)
+        return x
 
-        l_conv1 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_0)
-        l_conv1 = keras.layers.LeakyReLU()(l_conv1)
-        l_conv2 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv1)
-        l_skip1 = keras.layers.add([block_0, l_conv2])
-        block_1 = keras.layers.LeakyReLU()(l_skip1)
+class ModelMarsMoon(nn.Module):
+    def __init__(self, in_channels=3):
+        super().__init__()
+        self.initial_conv = nn.Conv2d(in_channels, 32, kernel_size=5, padding=2)
+        # 5 residual blocks, each with 2 conv layers
+        self.res_convs = nn.ModuleList()
+        for _ in range(5):
+            self.res_convs.append(nn.ModuleList([
+                nn.Conv2d(32, 32, kernel_size=5, padding=2),
+                nn.Conv2d(32, 32, kernel_size=5, padding=2),
+            ]))
+        self.output_conv = nn.Conv2d(32, 2, kernel_size=5, padding=2)
 
-        l_conv3 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_1)
-        l_conv3 = keras.layers.LeakyReLU()(l_conv3)
-        l_conv4 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv3)
-        l_skip2 = keras.layers.add([block_1, l_conv4])
-        block_2 = keras.layers.LeakyReLU()(l_skip2)
-
-        l_conv5 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_2)
-        l_conv5 = keras.layers.LeakyReLU()(l_conv5)
-        l_conv6 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv5)
-        l_skip3 = keras.layers.add([block_2, l_conv6])
-        block_3 = keras.layers.LeakyReLU()(l_skip3)
-
-        l_conv7 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_3)
-        l_conv7 = keras.layers.LeakyReLU()(l_conv7)
-        l_conv8 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv7)
-        l_skip4 = keras.layers.add([block_3, l_conv8])
-        block_4 = keras.layers.LeakyReLU()(l_skip4)
-
-        l_conv9 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_4)
-        l_conv9 = keras.layers.LeakyReLU()(l_conv9)
-        l_convA = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv9)
-        l_skip5 = keras.layers.add([block_4, l_convA])
-        block_5 = keras.layers.LeakyReLU()(l_skip5)
-
-        l_output = keras.layers.Conv2D(filters=2,  kernel_size=5, padding='same')(block_5)
-        return keras.models.Model(inputs=l_input, outputs=l_output, name='mars_moon')
+    def forward(self, x):
+        x = F.leaky_relu(self.initial_conv(x))
+        for conv1, conv2 in self.res_convs:
+            residual = x
+            x = F.leaky_relu(conv1(x))
+            x = conv2(x)
+            x = F.leaky_relu(x + residual)
+        x = self.output_conv(x)
+        return x
 
 def lr_schedule(epoch, current_lr):
     """Learning Rate Schedule
@@ -380,141 +371,140 @@ dataset = PhifDataset(
 )
 if params['only_ds']: exit(0)
 
-if params['pretf']:
-    with open(os.path.dirname(params['pretf'])+'/stats.pickle', 'rb') as f: ld_stats = pickle.load(f)
+if params['prept']:
+    with open(os.path.dirname(params['prept'])+'/stats.pickle', 'rb') as f: ld_stats = pickle.load(f)
     dataset.dataStats['in.std'] = (ld_stats['in.std'][0], (ld_stats['in.std'][1], ld_stats['in.std'][2]))
     dataset.dataStats['out.std'] = ld_stats['out.std']
     log.info(dataset.dataStats)
 
 if params['resume']>0:
-    with open(params['tf']+'/dataStats.pickle', 'rb') as f: dataset.dataStats = pickle.load(f)
+    with open(params['pt']+'/dataStats.pickle', 'rb') as f: dataset.dataStats = pickle.load(f)
 
 if (params['train'] is None):
     log.info(params['train'])
     log.info('No pre-loadable training data path is given.')
     exit(0)
 
-tf_tb_writer = tf.summary.create_file_writer(params['tf']+'/summary/training')
+from torch.utils.tensorboard import SummaryWriter
+tb_writer = SummaryWriter(log_dir=params['pt']+'/summary/training')
 
 # model
-netModel = eval('model_{}'.format(params['model']))
-model = netModel(dict(shape=(params['res']*2, params['res'], 3)))
-model.summary(print_fn=log.info)
+model_classes = {
+    'mercury': ModelMercury,
+    'mars_moon': ModelMarsMoon,
+}
+model = model_classes[params['model']](in_channels=3).to(device)
+log.info(model)
 
-if params['pretf']:
-    log.info('load a pre-trained model: {}'.format(params['pretf']))
-    ld_model = keras.models.load_model(params['pretf'], compile=False)
-    model.set_weights(ld_model.get_weights())
+if params['prept']:
+    log.info('load a pre-trained model: {}'.format(params['prept']))
+    model.load_state_dict(torch.load(params['prept'], map_location=device))
 
-if params['inittf']:
-    log.info('load an initial model (warm start): {}'.format(params['inittf']))
-    ld_model = keras.models.load_model(params['inittf'], compile=False)
-    model.set_weights(ld_model.get_weights())
+if params['initpt']:
+    log.info('load an initial model (warm start): {}'.format(params['initpt']))
+    model.load_state_dict(torch.load(params['initpt'], map_location=device))
 
 if params['resume']<1:
-    [ params['tf'] and distutils.dir_util.mkpath(params['tf']) ]
-    with open(params['tf']+'/dataStats.pickle', 'wb') as f: pickle.dump(dataset.dataStats, f)
+    [ params['pt'] and distutils.dir_util.mkpath(params['pt']) ]
+    with open(params['pt']+'/dataStats.pickle', 'wb') as f: pickle.dump(dataset.dataStats, f)
 
 else:
-    ld_model = keras.models.load_model(params['tf']+'/model_epoch{:04d}.h5'.format(params['resume']))
-    model.set_weights(ld_model.get_weights())
+    model.load_state_dict(torch.load(params['pt']+'/model_epoch{:04d}.pt'.format(params['resume']), map_location=device))
 
-opt = tf.keras.optimizers.Adam(learning_rate=params['lr'])
+opt = torch.optim.Adam(model.parameters(), lr=params['lr'])
 
 def to_feature(dens_vel_grid_array, ext_const_channel):
     # drop the unused edges of the staggered velocity grid making its dim same to the centered grid's
-    with tf.name_scope('to_feature') as scope:
-        return math.stack(
-            [
-                dens_vel_grid_array[1].vector['x'].x[:-1].values,         # u
-                dens_vel_grid_array[1].vector['y'].y[:-1].values,         # v
-                math.ones(dens_vel_grid_array[0].shape)*ext_const_channel # Re
-            ],
-            math.channel('channels')
-        )
+    return math.stack(
+        [
+            dens_vel_grid_array[1].vector['x'].x[:-1].values,         # u
+            dens_vel_grid_array[1].vector['y'].y[:-1].values,         # v
+            math.ones(dens_vel_grid_array[0].shape)*ext_const_channel # Re
+        ],
+        math.channel('channels')
+    )
 
-def to_staggered(tf_tensor, domain):
-    with tf.name_scope('to_staggered') as scope:
-        return domain.staggered_grid(
-            math.stack(
-                [
-                    math.tensor(tf.pad(tf_tensor[..., 1], [(0,0), (0,1), (0,0)]), math.batch('batch'), math.spatial('y, x')), # v
-                    math.tensor(tf.pad(tf_tensor[..., 0], [(0,0), (0,0), (0,1)]), math.batch('batch'), math.spatial('y, x')), # u
-                ], math.channel('vector')
-            )
+def to_staggered(torch_tensor, domain):
+    # torch_tensor is NCHW: [batch, 2, y, x]; convert back to NHWC: [batch, y, x, 2]
+    torch_tensor_nhwc = torch_tensor.permute(0, 2, 3, 1)
+    return domain.staggered_grid(
+        math.stack(
+            [
+                math.tensor(F.pad(torch_tensor_nhwc[..., 1], (0, 0, 0, 1)), math.batch('batch'), math.spatial('y, x')), # v
+                math.tensor(F.pad(torch_tensor_nhwc[..., 0], (0, 1, 0, 0)), math.batch('batch'), math.spatial('y, x')), # u
+            ], math.channel('vector')
         )
+    )
 
 def train_step(pf_in_dens_gt, pf_in_velo_gt, pf_in_Re, i_step):
-    with tf.name_scope('train_step'), tf.GradientTape() as tape:
-        with tf.name_scope('sol') as scope:
-            pf_co_prd, pf_cv_md = [], [] # predicted states with correction, inferred velocity corrections
-            for i in range(params['msteps']):
-                with tf.name_scope('solve_and_correct') as scope:
-                    with tf.name_scope('solver_step') as scope:
-                        pf_co_prd += [
-                            simulator_lo.step(
-                                density_in=pf_in_dens_gt[0] if i==0 else pf_co_prd[-1][0],
-                                velocity_in=pf_in_velo_gt[0] if i==0 else pf_co_prd[-1][1],
-                                re=pf_in_Re,
-                                res=params['res'],
-                            )
-                        ]       # pf_co_prd: [[density1, velocity1], [density2, velocity2], ...]
+    opt.zero_grad()
 
-                    with tf.name_scope('pred') as scope:
-                        model_input = to_feature(pf_co_prd[-1], pf_in_Re)
-                        model_input /= math.tensor([dataset.dataStats['std'][1], dataset.dataStats['std'][2], dataset.dataStats['ext.std'][0]], channel('channels')) # [u, v, Re]
-                        model_out = model(model_input.native(['batch', 'y', 'x', 'channels']), training=True)
-                        model_out *= [dataset.dataStats['std'][1], dataset.dataStats['std'][2]] # [u, v]
-                        pf_cv_md += [ to_staggered(model_out, domain) ]                         # pf_cv_md: [velocity_correction1, velocity_correction2, ...]
+    pf_co_prd, pf_cv_md = [], [] # predicted states with correction, inferred velocity corrections
+    for i in range(params['msteps']):
+        # solver step
+        pf_co_prd += [
+            simulator_lo.step(
+                density_in=pf_in_dens_gt[0] if i==0 else pf_co_prd[-1][0],
+                velocity_in=pf_in_velo_gt[0] if i==0 else pf_co_prd[-1][1],
+                re=pf_in_Re,
+                res=params['res'],
+            )
+        ]       # pf_co_prd: [[density1, velocity1], [density2, velocity2], ...]
 
-                    pf_co_prd[-1][1] = pf_co_prd[-1][1] + pf_cv_md[-1]
+        # prediction (correction)
+        model_input = to_feature(pf_co_prd[-1], pf_in_Re)
+        model_input /= math.tensor([dataset.dataStats['std'][1], dataset.dataStats['std'][2], dataset.dataStats['ext.std'][0]], channel('channels')) # [u, v, Re]
+        model_input_native = model_input.native(['batch', 'y', 'x', 'channels']) # NHWC
+        model_input_nchw = model_input_native.permute(0, 3, 1, 2)               # NCHW
+        model_out_nchw = model(model_input_nchw)                                 # NCHW
+        model_out_nhwc = model_out_nchw.permute(0, 2, 3, 1)                      # NHWC
+        model_out_nhwc = model_out_nhwc * torch.tensor([dataset.dataStats['std'][1], dataset.dataStats['std'][2]], device=device) # [u, v]
+        pf_cv_md += [ to_staggered(model_out_nhwc.permute(0, 3, 1, 2), domain) ] # pf_cv_md: [velocity_correction1, velocity_correction2, ...]
 
-        with tf.name_scope('loss') as scope, tf_tb_writer.as_default():
-            with tf.name_scope('steps_x') as scope:
-                loss_steps_x = [
-                    tf.nn.l2_loss(
-                        (
-                            pf_in_velo_gt[i+1].vector['x'].values.native(('batch', 'y', 'x'))
-                            - pf_co_prd[i][1].vector['x'].values.native(('batch', 'y', 'x'))
-                        )/dataset.dataStats['std'][1]
-                    )
-                    for i in range(params['msteps'])
-                ]
-                loss_steps_x_sum = tf.math.reduce_sum(loss_steps_x)
+        pf_co_prd[-1][1] = pf_co_prd[-1][1] + pf_cv_md[-1]
 
-            with tf.name_scope('steps_y') as scope:
-                loss_steps_y = [
-                    tf.nn.l2_loss(
-                        (
-                            pf_in_velo_gt[i+1].vector['y'].values.native(('batch', 'y', 'x'))
-                            - pf_co_prd[i][1].vector['y'].values.native(('batch', 'y', 'x'))
-                        )/dataset.dataStats['std'][2]
-                    )
-                    for i in range(params['msteps'])
-                ]
-                loss_steps_y_sum = tf.math.reduce_sum(loss_steps_y)
+    # loss computation
+    loss_steps_x = [
+        torch.sum(
+            (
+                pf_in_velo_gt[i+1].vector['x'].values.native(('batch', 'y', 'x'))
+                - pf_co_prd[i][1].vector['x'].values.native(('batch', 'y', 'x'))
+            )**2
+        ) / 2 / dataset.dataStats['std'][1]**2
+        for i in range(params['msteps'])
+    ]
+    loss_steps_x_sum = torch.sum(torch.stack(loss_steps_x))
 
-            loss = (loss_steps_x_sum + loss_steps_y_sum)/params['msteps']
+    loss_steps_y = [
+        torch.sum(
+            (
+                pf_in_velo_gt[i+1].vector['y'].values.native(('batch', 'y', 'x'))
+                - pf_co_prd[i][1].vector['y'].values.native(('batch', 'y', 'x'))
+            )**2
+        ) / 2 / dataset.dataStats['std'][2]**2
+        for i in range(params['msteps'])
+    ]
+    loss_steps_y_sum = torch.sum(torch.stack(loss_steps_y))
 
-            for i,a_step_loss in enumerate(loss_steps_x): tf.summary.scalar(name='loss_each_step_vel_x{:02d}'.format(i+1), data=a_step_loss, step=math.to_int64(i_step).native())
-            for i,a_step_loss in enumerate(loss_steps_y): tf.summary.scalar(name='loss_each_step_vel_y{:02d}'.format(i+1), data=a_step_loss, step=math.to_int64(i_step).native())
-            tf.summary.scalar(name='sum_steps_loss', data=loss, step=math.to_int64(i_step).native())
+    loss = (loss_steps_x_sum + loss_steps_y_sum)/params['msteps']
 
-            total_loss = loss
-            if params['reg_loss']:
-                reg_loss = tf.math.add_n(model.losses)
-                total_loss += reg_loss
-                tf.summary.scalar(name='loss_regularization', data=reg_loss, step=math.to_int64(i_step).native())
+    i_step_val = int(math.to_int64(i_step).native())
+    for i,a_step_loss in enumerate(loss_steps_x): tb_writer.add_scalar('loss_each_step_vel_x{:02d}'.format(i+1), a_step_loss.item(), i_step_val)
+    for i,a_step_loss in enumerate(loss_steps_y): tb_writer.add_scalar('loss_each_step_vel_y{:02d}'.format(i+1), a_step_loss.item(), i_step_val)
+    tb_writer.add_scalar('sum_steps_loss', loss.item(), i_step_val)
 
-            tf.summary.scalar(name='loss', data=total_loss, step=math.to_int64(i_step).native())
+    total_loss = loss
+    if params['reg_loss']:
+        reg_loss = sum(torch.sum(p**2) / 2 for p in model.parameters())
+        total_loss = total_loss + reg_loss
+        tb_writer.add_scalar('loss_regularization', reg_loss.item(), i_step_val)
 
-        with tf.name_scope('apply_gradients') as scope:
-            gradients = tape.gradient(total_loss, model.trainable_variables)
-            opt.apply_gradients(zip(gradients, model.trainable_variables))
+    tb_writer.add_scalar('loss', total_loss.item(), i_step_val)
 
-        return math.tensor(total_loss)
+    total_loss.backward()
+    opt.step()
 
-jit_step = math.jit_compile(train_step)
+    return math.tensor(total_loss.item())
 
 i_st = 0
 for j in range(params['epochs']): # training
@@ -545,13 +535,7 @@ for j in range(params['epochs']): # training
             ]
             re_nr = math.tensor(adata[3], math.batch('batch'))
 
-            if i_st==0: tf.summary.trace_on(graph=True, profiler=True)
-
-            l2 = jit_step(dens_gt, velo_gt, re_nr, math.tensor(i_st))
-
-            if i_st==0:
-                with tf_tb_writer.as_default():
-                    tf.summary.trace_export(name="trace_train_step", step=i_st, profiler_outdir=params['tf']+'/summary/training')
+            l2 = train_step(dens_gt, velo_gt, re_nr, math.tensor(i_st))
 
             i_st += 1
 
@@ -562,7 +546,7 @@ for j in range(params['epochs']): # training
 
         dataset.nextBatch()
 
-    if j%10==9: model.save(params['tf']+'/model_epoch{:04d}.h5'.format(j+1))
+    if j%10==9: torch.save(model.state_dict(), params['pt']+'/model_epoch{:04d}.pt'.format(j+1))
 
-tf_tb_writer.close()
-model.save(params['tf']+'/model.h5')
+tb_writer.close()
+torch.save(model.state_dict(), params['pt']+'/model.pt')

@@ -47,19 +47,18 @@ params.update(vars(pargs))
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
 from phi.physics._boundaries import Domain, OPEN, STICKY as CLOSED
-from phi.tf.flow import *
+from phi.torch.flow import *
 
-gpus = tf.config.list_physical_devices('GPU')
-if gpus:
-    for gpu in gpus: tf.config.experimental.set_memory_growth(gpu, True)
-    logical_gpus = tf.config.experimental.list_logical_devices('GPU')
-    log.info('{} Physical GPUs {} Logical GPUs'.format(len(gpus), len(logical_gpus)))
+import torch
 
-from tensorflow import keras
+if torch.cuda.is_available():
+    gpu_count = torch.cuda.device_count()
+    log.info('{} GPUs available'.format(gpu_count))
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.random.set_seed(params['seed'])
+torch.manual_seed(params['seed'])
+if torch.cuda.is_available(): torch.cuda.manual_seed_all(params['seed'])
 
 class KarmanFlow():
     def __init__(self, domain):
@@ -115,7 +114,7 @@ scene = Scene.create(parent_directory=params['output']) # phiflow scene
 
 log.addHandler(logging.FileHandler(os.path.normpath(scene.path)+'/run.log'))
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
 if params['output']:
     with open(os.path.normpath(scene.path)+'/params.pickle', 'wb') as f: pickle.dump(params, f)
@@ -137,8 +136,6 @@ else:
 simulator = KarmanFlow(domain=domain)
 density, velocity = d0, v0
 
-jit_step = math.jit_compile(simulator.step)
-
 if params['skipsteps']==0 and params['output']:
     scene.write(
         data = {
@@ -157,7 +154,7 @@ if params['skipsteps']==0 and params['output']:
 
 for i in range(1, params['simsteps']):
     log.info('Step {:06d}'.format(i))
-    density, velocity = jit_step(
+    density, velocity = simulator.step(
         density,
         velocity,
         re=params['re'],

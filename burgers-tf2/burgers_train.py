@@ -7,7 +7,7 @@
 # Apache License, Version 2.0
 # http://www.apache.org/licenses/LICENSE-2.0
 #
-# Training
+# Training (PyTorch version)
 #
 # ----------------------------------------------------------------------------
 
@@ -39,23 +39,20 @@ parser.add_argument('--model',           default='mars_moon',       help='(prede
 parser.add_argument('--lr',              default=1e-3, type=float,  help='start learning rate')
 parser.add_argument('--adplr',           action='store_true',       help='turn on adaptive learning rate')
 parser.add_argument('--resume',          default=-1, type=int,      help='resume training epochs')
-parser.add_argument('--inittf',          default=None,              help='load initial model weights (warm start)')
-parser.add_argument('--pretf',           default=None,              help='load pre-trained weights (only for testing pre-trained supervised model; do not use for a warm start!)')
-parser.add_argument('--tf',              default='/tmp/phiflow/tf', help='path to a tensorflow output dir (model, logs, etc.)')
+parser.add_argument('--initpt',          default=None,              help='load initial model weights (warm start)')
+parser.add_argument('--prept',           default=None,              help='load pre-trained weights (only for testing pre-trained supervised model; do not use for a warm start!)')
+parser.add_argument('--pt',              default='/tmp/phiflow/pt', help='path to a pytorch output dir (model, logs, etc.)')
 sys.argv += ['--' + p for p in params if isinstance(params[p], bool) and params[p]]
 pargs = parser.parse_args()
 params.update(vars(pargs))
 
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
-if params['cuda']: from phi.tf.tf_cuda_pressuresolver import CUDASolver
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 
-from phi.tf.flow import *
-from tensorflow import keras
-
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
-tf_session = tf.Session(config=config)
+from phi.flow import *
 
 if params['log']:
     if params['resume']>0: params['log'] = os.path.splitext(params['log'])[0] + '_resume{:04d}'.format(params['resume']) + os.path.splitext(params['log'])[1]
@@ -67,83 +64,67 @@ if (params['nsims'] % params['sbatch']) != 0:
     log.info('Number of simulations is not divided by the batch size thus adjusted to {}'.format(params['nsims']))
 
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.compat.v1.set_random_seed(params['seed'])
+torch.manual_seed(params['seed'])
+
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 def to_feature(smokestates, forcestates):
     # input feature used for supervised version; drop the unused edges of the
     # staggered velocity grid making its dim same to the centered grid's
-    with tf.name_scope('to_feature') as scope:
-        return math.concat(
-            [smokestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(smokestates))] +
-            [forcestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(forcestates))],
-            axis=-1
-        )
+    return math.concat(
+        [smokestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(smokestates))] +
+        [forcestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(forcestates))],
+        axis=-1
+    )
 
 def to_feature_noforce(smokestates):
     # input feature used for supervised version; drop the unused edges of the
     # staggered velocity grid making its dim same to the centered grid's
-    with tf.name_scope('to_feature') as scope:
-        return math.concat(
-            [smokestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(smokestates))],
-            axis=-1
-        )
+    return math.concat(
+        [smokestates[j].velocity.staggered_tensor()[:, :-1:, :-1:, 0:2] for j in range(len(smokestates))],
+        axis=-1
+    )
 
 def to_staggered(tensor_cen, box):
-    with tf.name_scope('to_staggered') as scope:
-        return StaggeredGrid(math.pad(tensor_cen, ((0,0), (0,1), (0,1), (0,0))), box=box)
+    return StaggeredGrid(math.pad(tensor_cen, ((0,0), (0,1), (0,1), (0,0))), box=box)
 
 
-def model_mercury(tensor_in):
-    with tf.name_scope('model_mercury') as scope:
-        return keras.Sequential([
-            keras.layers.Input(tensor=tensor_in),
-            keras.layers.Conv2D(filters=32, kernel_size=5, padding='same', activation=tf.nn.relu),
-            keras.layers.Conv2D(filters=64, kernel_size=5, padding='same', activation=tf.nn.relu),
-            keras.layers.Conv2D(filters=2,  kernel_size=5, padding='same', activation=None),  # u, v
-        ])
+class ModelMercury(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv1 = nn.Conv2d(in_channels, 32, kernel_size=5, padding=2)
+        self.conv2 = nn.Conv2d(32, 64, kernel_size=5, padding=2)
+        self.conv3 = nn.Conv2d(64, 2, kernel_size=5, padding=2)
 
-def model_mars_moon(tensor_in):
-    with tf.name_scope('model_mars_moon') as scope:
-        l_input = keras.layers.Input(tensor=tensor_in)
-        block_0 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_input)
-        block_0 = keras.layers.LeakyReLU()(block_0)
+    def forward(self, x):
+        x = F.relu(self.conv1(x))
+        x = F.relu(self.conv2(x))
+        return self.conv3(x)
 
-        l_conv1 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_0)
-        l_conv1 = keras.layers.LeakyReLU()(l_conv1)
-        l_conv2 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv1)
-        l_skip1 = keras.layers.add([block_0, l_conv2])
-        block_1 = keras.layers.LeakyReLU()(l_skip1)
+class ModelMarsMoon(nn.Module):
+    def __init__(self, in_channels):
+        super().__init__()
+        self.initial_conv = nn.Conv2d(in_channels, 32, kernel_size=5, padding=2)
+        self.res_convs = nn.ModuleList()
+        for _ in range(5):
+            self.res_convs.append(nn.ModuleList([
+                nn.Conv2d(32, 32, kernel_size=5, padding=2),
+                nn.Conv2d(32, 32, kernel_size=5, padding=2),
+            ]))
+        self.output_conv = nn.Conv2d(32, 2, kernel_size=5, padding=2)
 
-        l_conv3 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_1)
-        l_conv3 = keras.layers.LeakyReLU()(l_conv3)
-        l_conv4 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv3)
-        l_skip2 = keras.layers.add([block_1, l_conv4])
-        block_2 = keras.layers.LeakyReLU()(l_skip2)
-
-        l_conv5 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_2)
-        l_conv5 = keras.layers.LeakyReLU()(l_conv5)
-        l_conv6 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv5)
-        l_skip3 = keras.layers.add([block_2, l_conv6])
-        block_3 = keras.layers.LeakyReLU()(l_skip3)
-
-        l_conv7 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_3)
-        l_conv7 = keras.layers.LeakyReLU()(l_conv7)
-        l_conv8 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv7)
-        l_skip4 = keras.layers.add([block_3, l_conv8])
-        block_4 = keras.layers.LeakyReLU()(l_skip4)
-
-        l_conv9 = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(block_4)
-        l_conv9 = keras.layers.LeakyReLU()(l_conv9)
-        l_convA = keras.layers.Conv2D(filters=32, kernel_size=5, padding='same')(l_conv9)
-        l_skip5 = keras.layers.add([block_4, l_convA])
-        block_5 = keras.layers.LeakyReLU()(l_skip5)
-
-        l_output = keras.layers.Conv2D(filters=2,  kernel_size=5, padding='same')(block_5)
-        return keras.models.Model(inputs=l_input, outputs=l_output)
+    def forward(self, x):
+        x = F.leaky_relu(self.initial_conv(x))
+        for conv1, conv2 in self.res_convs:
+            residual = x
+            x = F.leaky_relu(conv1(x))
+            x = conv2(x)
+            x = F.leaky_relu(x + residual)
+        return self.output_conv(x)
 
 def downsample4xSMAC(tensor):
     return StaggeredGrid(tensor).downsample2x().downsample2x().staggered_tensor()
@@ -335,14 +316,14 @@ dataset = PhifDataset(
 )
 if params['only_ds']: exit(0)
 
-if params['pretf']:
-    with open(os.path.dirname(params['pretf'])+'/stats.pickle', 'rb') as f: ld_stats = pickle.load(f)
+if params['prept']:
+    with open(os.path.dirname(params['prept'])+'/stats.pickle', 'rb') as f: ld_stats = pickle.load(f)
     dataset.dataStats['in.std'] = ((ld_stats['in.std'][0], ld_stats['in.std'][1]),)
     dataset.dataStats['out.std'] = ld_stats['out.std']
     log.info(dataset.dataStats)
 
 if params['resume']>0:
-    with open(params['tf']+'/dataStats.pickle', 'rb') as f: dataset.dataStats = pickle.load(f)
+    with open(params['pt']+'/dataStats.pickle', 'rb') as f: dataset.dataStats = pickle.load(f)
 
 dm_co = Domain(resolution=list(dataset.resolution), box=box([params['len']]*2), boundaries=PERIODIC)
 
@@ -350,116 +331,52 @@ st_co =   BurgersVelocitySMAC(dm_co, batch_size=params['sbatch'])
 st_gt = [ BurgersVelocitySMAC(dm_co, batch_size=params['sbatch']) for _ in range(params['msteps']) ]  # ground truth velocities
 st_fr = [ BurgersVelocitySMAC(dm_co, batch_size=params['sbatch']) for _ in range(params['msteps']) ]  # forces
 
-with tf.name_scope('input') as scope:
-    with tf.name_scope('co') as scope: tf_st_co_in =   placeholder(st_co.shape)
-    with tf.name_scope('fl') as scope: tf_st_fr_in = [ placeholder(st_co.shape) for _ in range(params['msteps']) ]
-    with tf.name_scope('lr') as scope: tf_vr_lr_in =   tf.placeholder(tf.float32, shape=[])  # learning rate
-    with tf.name_scope('ld') as scope: tf_st_gt_in = [ placeholder(st_co.shape) for _ in range(params['msteps']) ]
-
 if (params['train'] is None):
     log.info(params['train'])
     log.info('No pre-loadable training data path is given.')
     exit(0)
 
 scene = Scene.create(params['train'], count=params['sbatch'], mkdir=False, copy_calling_script=False)
-sess = Session(scene, session=tf_session)
-tf.compat.v1.keras.backend.set_session(tf_session)
 
-with tf.name_scope('model') as scope:
-    netModel = eval('model_{}'.format(params['model']))
-    model = netModel(
-        to_feature_noforce(smokestates=[tf_st_co_in,])
-        if params['noforce'] else
-        to_feature(smokestates=[tf_st_co_in,], forcestates=[tf_st_fr_in[0],])
-    )
+# Determine input channels based on noforce flag
+if params['noforce']:
+    in_channels = 2   # velocity only (u, v)
+else:
+    in_channels = 4   # velocity (u, v) + force (u, v)
 
-with tf.name_scope('training') as scope:
-    with tf.name_scope('corre') as scope:
-        tf_st_co_prd, tf_cv_md = [], []
-        for i in range(params['msteps']):
-            with tf.name_scope('step_w_pred') as scope:
-                with tf.name_scope('step') as scope:
-                    tf_st_co_prd += [
-                        simulator_lo.step(
-                            v=tf_st_co_in if i==0 else tf_st_co_prd[-1],
-                            dt=params['dt']
-                        )
-                        if params['noforce'] else
-                        simulator_lo.step_with_f(
-                            v=tf_st_co_in if i==0 else tf_st_co_prd[-1],
-                            f=tf_st_fr_in[i],
-                            dt=params['dt']
-                        )
-                    ]
+# Create model
+if params['model'] == 'mercury':
+    model = ModelMercury(in_channels).to(device)
+elif params['model'] == 'mars_moon':
+    model = ModelMarsMoon(in_channels).to(device)
+else:
+    raise ValueError('Unknown model: {}'.format(params['model']))
 
-                with tf.name_scope('pred') as scope:
-                    tf_cv_md += [
-                        to_staggered(
-                            model(
-                                (to_feature_noforce(smokestates=[tf_st_co_prd[-1]])/[
-                                    # in.std and out.std are used in the supervised model, here active only when loading pretf
-                                    *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),  # velocity
-                                ])
-                                if params['noforce'] else
-                                (to_feature(smokestates=[tf_st_co_prd[-1]], forcestates=[tf_st_fr_in[i]])/[
-                                    # in.std and out.std are used in the supervised model, here active only when loading pretf
-                                    *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),  # velocity
-                                    *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][1]),  # force
-                                ])
-                            )*(dataset.dataStats['out.std' if 'out.std' in dataset.dataStats else 'std'][0]),
-                            box=st_co.velocity.box
-                        )
-                    ]
+log.info(model)
 
-                tf_st_co_prd[-1] = tf_st_co_prd[-1].copied_with(velocity=tf_st_co_prd[-1].velocity + tf_cv_md[-1])
+if params['prept']:
+    log.info('load a pre-trained model: {}'.format(params['prept']))
+    model.load_state_dict(torch.load(params['prept'], map_location=device))
 
-    with tf.name_scope('loss') as scope:
-        loss_steps = [
-            tf.nn.l2_loss(
-                (tf_st_gt_in[i].velocity.staggered_tensor() - tf_st_co_prd[i].velocity.staggered_tensor())
-                /dataset.dataStats['std'][0]
-            )
-            for i in range(params['msteps'])
-        ]
-        for i,a_step_loss in enumerate(loss_steps): tf.compat.v1.summary.scalar(name='loss_step{:02d}'.format(i), tensor=a_step_loss)
-        loss = tf.reduce_sum(loss_steps)/params['msteps']
-        tf.compat.v1.summary.scalar(name='l2', tensor=loss)
-
-        total_loss = loss
-
-        with tf.name_scope('all_in_one') as scope:
-            tf.compat.v1.summary.scalar(name='total_loss', tensor=total_loss)
-            tf.compat.v1.summary.scalar(name='lr', tensor=tf_vr_lr_in)
-
-        train_step = tf.compat.v1.train.AdamOptimizer(learning_rate=tf_vr_lr_in).minimize(total_loss)
-
-model.summary(print_fn=log.info)
-sess.initialize_variables()
-
-if params['pretf']:
-    log.info('load a pre-trained model: {}'.format(params['pretf']))
-    ld_model = keras.models.load_model(params['pretf'], compile=False)
-    model.set_weights(ld_model.get_weights())
-
-if params['inittf']:
-    log.info('load an initial model (warm start): {}'.format(params['inittf']))
-    ld_model = keras.models.load_model(params['inittf'], compile=False)
-    model.set_weights(ld_model.get_weights())
+if params['initpt']:
+    log.info('load an initial model (warm start): {}'.format(params['initpt']))
+    model.load_state_dict(torch.load(params['initpt'], map_location=device))
 
 if params['resume']<1:
-    [ params['tf'] and distutils.dir_util.mkpath(params['tf']) ]
-    with open(params['tf']+'/dataStats.pickle', 'wb') as f: pickle.dump(dataset.dataStats, f)
+    [ params['pt'] and distutils.dir_util.mkpath(params['pt']) ]
+    with open(params['pt']+'/dataStats.pickle', 'wb') as f: pickle.dump(dataset.dataStats, f)
 else:
-    loadpath = params['tf']+'/model_epoch{:04d}.h5'.format(params['resume'])
+    loadpath = params['pt']+'/model_epoch{:04d}.pt'.format(params['resume'])
     log.info('load a resuming model (trained up to {} epoths): {}'.format(params['resume'], loadpath))
-    ld_model = keras.models.load_model(loadpath, compile=False)
-    model.set_weights(ld_model.get_weights())
+    model.load_state_dict(torch.load(loadpath, map_location=device))
 
-tf_summary_merged = tf.compat.v1.summary.merge_all()
-tf_writer_tr = tf.compat.v1.summary.FileWriter(params['tf']+'/summary/training')
-if params['resume']<1: tf_writer_tr.add_graph(sess.graph)
+# TensorBoard
+from torch.utils.tensorboard import SummaryWriter
+tb_writer = SummaryWriter(log_dir=params['pt']+'/summary/training')
 
 current_lr = params['lr']
+opt = torch.optim.Adam(model.parameters(), lr=current_lr)
+
 i_st = 0
 for j in range(params['epochs']):  # training
     dataset.newEpoch(exclude_tail=params['msteps'])
@@ -469,6 +386,9 @@ for j in range(params['epochs']):  # training
         continue
 
     current_lr = lr_schedule(j, current_lr) if params['adplr'] else params['lr']
+    for param_group in opt.param_groups:
+        param_group['lr'] = current_lr
+
     for ib in range(dataset.numOfBatchs):   # for each batch
         for i in range(dataset.numOfSteps):  # for each step
             adata = dataset.getData(consecutive_frames=params['msteps'], with_skip=1)
@@ -476,12 +396,145 @@ for j in range(params['epochs']):  # training
             if not params['noforce']: st_fr = [ st_fr[k].copied_with(velocity=adata[1][k  ]) for k in range(params['msteps']) ]
             st_gt = [ st_gt[k].copied_with(velocity=adata[0][k+1]) for k in range(params['msteps']) ]
 
-            my_feed_dict = { tf_st_co_in: st_co, tf_vr_lr_in: current_lr }
-            my_feed_dict.update(zip(tf_st_gt_in, st_gt))
-            if not params['noforce']: my_feed_dict.update(zip(tf_st_fr_in, st_fr))
-            summary, _, l2 = sess.run([tf_summary_merged, train_step, total_loss], my_feed_dict)
+            opt.zero_grad()
 
-            tf_writer_tr.add_summary(summary, i_st)
+            # Multi-step prediction with correction
+            tf_st_co_prd = []
+            tf_cv_md = []
+            for mi in range(params['msteps']):
+                # Solver step
+                if params['noforce']:
+                    pred = simulator_lo.step(
+                        v=st_co if mi==0 else tf_st_co_prd[-1],
+                        dt=params['dt']
+                    )
+                else:
+                    pred = simulator_lo.step_with_f(
+                        v=st_co if mi==0 else tf_st_co_prd[-1],
+                        f=st_fr[mi],
+                        dt=params['dt']
+                    )
+                tf_st_co_prd.append(pred)
+
+                # Build feature and run model
+                if params['noforce']:
+                    feature = to_feature_noforce(smokestates=[tf_st_co_prd[-1]])
+                    in_std = [
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),  # velocity
+                    ]
+                else:
+                    feature = to_feature(smokestates=[tf_st_co_prd[-1]], forcestates=[st_fr[mi]])
+                    in_std = [
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),  # velocity
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][1]),  # force
+                    ]
+
+                feature_normalized = feature / in_std
+                out_std = dataset.dataStats['out.std' if 'out.std' in dataset.dataStats else 'std'][0]
+
+                # NHWC -> NCHW for PyTorch conv
+                model_input = torch.tensor(np.array(feature_normalized), dtype=torch.float32).permute(0, 3, 1, 2).to(device)
+                model_out = model(model_input)
+                # NCHW -> NHWC
+                model_out_nhwc = model_out.permute(0, 2, 3, 1)
+                model_out_denorm = model_out_nhwc * torch.tensor(out_std, dtype=torch.float32, device=device)
+
+                correction = to_staggered(model_out_denorm.detach().cpu().numpy(), box=st_co.velocity.box)
+                tf_cv_md.append(correction)
+
+                tf_st_co_prd[-1] = tf_st_co_prd[-1].copied_with(velocity=tf_st_co_prd[-1].velocity + correction)
+
+            # Compute loss
+            loss_steps = []
+            for mi in range(params['msteps']):
+                gt_vel = torch.tensor(
+                    np.array(st_gt[mi].velocity.staggered_tensor()),
+                    dtype=torch.float32, device=device
+                )
+                pred_vel = torch.tensor(
+                    np.array(tf_st_co_prd[mi].velocity.staggered_tensor()),
+                    dtype=torch.float32, device=device
+                )
+                norm_std = torch.tensor(dataset.dataStats['std'][0], dtype=torch.float32, device=device)
+                step_loss = torch.sum(((gt_vel - pred_vel) / norm_std)**2) / 2
+                loss_steps.append(step_loss)
+
+            total_loss = sum(loss_steps) / params['msteps']
+
+            # NOTE: Because the simulation steps use PhiFlow (not differentiable through PyTorch),
+            # we need to compute gradients only through the model output.
+            # Re-run the model forward pass to get a differentiable loss.
+
+            # Re-run forward passes with gradient tracking
+            opt.zero_grad()
+            diff_loss_total = torch.tensor(0.0, dtype=torch.float32, device=device)
+
+            # We need to re-run the model forward for each step to get gradients
+            st_co_curr = st_co
+            for mi in range(params['msteps']):
+                # Solver step (non-differentiable)
+                if params['noforce']:
+                    pred = simulator_lo.step(v=st_co_curr, dt=params['dt'])
+                else:
+                    pred = simulator_lo.step_with_f(v=st_co_curr, f=st_fr[mi], dt=params['dt'])
+
+                # Build feature
+                if params['noforce']:
+                    feature = to_feature_noforce(smokestates=[pred])
+                    in_std = [
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),
+                    ]
+                else:
+                    feature = to_feature(smokestates=[pred], forcestates=[st_fr[mi]])
+                    in_std = [
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][0]),
+                        *(dataset.dataStats['in.std' if 'in.std' in dataset.dataStats else 'std'][1]),
+                    ]
+
+                feature_normalized = feature / in_std
+                out_std_vals = dataset.dataStats['out.std' if 'out.std' in dataset.dataStats else 'std'][0]
+
+                # NHWC -> NCHW
+                model_input = torch.tensor(np.array(feature_normalized), dtype=torch.float32).permute(0, 3, 1, 2).to(device)
+                model_out = model(model_input)
+                # NCHW -> NHWC
+                model_out_nhwc = model_out.permute(0, 2, 3, 1)
+                model_out_denorm = model_out_nhwc * torch.tensor(out_std_vals, dtype=torch.float32, device=device)
+
+                # Pad to staggered grid shape
+                model_out_padded = F.pad(model_out_denorm, (0, 0, 0, 1, 0, 1))  # pad spatial dims (H+1, W+1)
+
+                # Get solver prediction and ground truth as tensors
+                pred_vel_np = np.array(pred.velocity.staggered_tensor())
+                pred_vel = torch.tensor(pred_vel_np, dtype=torch.float32, device=device)
+
+                gt_vel_np = np.array(st_gt[mi].velocity.staggered_tensor())
+                gt_vel = torch.tensor(gt_vel_np, dtype=torch.float32, device=device)
+
+                norm_std = torch.tensor(dataset.dataStats['std'][0], dtype=torch.float32, device=device)
+
+                corrected_vel = pred_vel + model_out_padded
+                step_loss = torch.sum(((gt_vel - corrected_vel) / norm_std)**2) / 2
+                diff_loss_total = diff_loss_total + step_loss
+
+                # Update state for next multi-step
+                correction_np = model_out_padded.detach().cpu().numpy()
+                correction_sg = to_staggered(model_out_denorm.detach().cpu().numpy(), box=st_co.velocity.box)
+                st_co_curr = pred.copied_with(velocity=pred.velocity + correction_sg)
+
+            diff_loss_total = diff_loss_total / params['msteps']
+            diff_loss_total.backward()
+            opt.step()
+
+            l2 = diff_loss_total.item()
+
+            # TensorBoard logging
+            for mi, sl in enumerate(loss_steps):
+                tb_writer.add_scalar('loss_step{:02d}'.format(mi), sl.item(), i_st)
+            tb_writer.add_scalar('l2', l2, i_st)
+            tb_writer.add_scalar('total_loss', l2, i_st)
+            tb_writer.add_scalar('lr', current_lr, i_st)
+
             i_st += 1
 
             log.info('epoch {:03d}/{:03d}, batch {:03d}/{:03d}, step {:04d}/{:04d}: loss={}'.format(
@@ -491,7 +544,7 @@ for j in range(params['epochs']):  # training
 
         dataset.nextBatch()
 
-    if j%10==9 or j==0: model.save(params['tf']+'/model_epoch{:04d}.h5'.format(j+1))
+    if j%10==9 or j==0: torch.save(model.state_dict(), params['pt']+'/model_epoch{:04d}.pt'.format(j+1))
 
-tf_writer_tr.close()
-model.save(params['tf']+'/model.h5')
+tb_writer.close()
+torch.save(model.state_dict(), params['pt']+'/model.pt')

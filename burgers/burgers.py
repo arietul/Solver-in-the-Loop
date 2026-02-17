@@ -52,17 +52,13 @@ params.update(vars(pargs))
 
 os.environ['CUDA_VISIBLE_DEVICES'] = params['gpu']
 
-if params['cuda']: from phi.tf.tf_cuda_pressuresolver import CUDASolver
+from phi.flow import *
 
-from phi.tf.flow import *
-import phi.tf.util
-
-import tensorflow as tf
-from tensorflow import keras
+import torch
 
 random.seed(params['seed'])
 np.random.seed(params['seed'])
-tf.compat.v1.set_random_seed(params['seed'])
+torch.manual_seed(params['seed'])
 
 def downsample4xSMAC(tensor):
     return StaggeredGrid(tensor).downsample2x().downsample2x().staggered_tensor()
@@ -128,30 +124,16 @@ if fc_files:
 
 # phiflow scene
 
-config = tf.compat.v1.ConfigProto()
-config.gpu_options.allow_growth = True  # dynamically grow the memory used on the GPU
-tf_session = tf.Session(config=config)
-
 scene = Scene.create(directory=params['output'])
-sess  = Session(scene, session=tf_session)
 
 log.addHandler(logging.FileHandler(os.path.normpath(scene.path)+'/run.log'))
 log.info(params)
-log.info('tensorflow-{} ({}, {}); keras-{} ({})'.format(tf.__version__, tf.sysconfig.get_include(), tf.sysconfig.get_lib(), keras.__version__, keras.__path__))
+log.info('torch-{}'.format(torch.__version__))
 
 if params['output']:
     with open(os.path.normpath(scene.path)+'/params.pickle', 'wb') as f: pickle.dump(params, f)
 
 simulator = BurgersTest()
-
-tf_st_in = phi.tf.util.placeholder_like(st)
-tf_fc_in = phi.tf.util.placeholder_like(fc)
-tf_st = simulator.step_with_f(v=tf_st_in, f=tf_fc_in, dt=params['dt']) if not params['noforce'] else simulator.step(v=tf_st_in, dt=params['dt'])
-tf_fc = tf_fc_in
-
-if fc_files is None:            # for regular sim with randomization forces
-    tf_fcs_in = phi.tf.util.placeholder_like(forces)
-    tf_fcs = [ physics.step(force, dt=params['dt']) for force, physics in zip(tf_fcs_in, force_physics) ]
 
 if params['skipsteps']==0 and params['output'] is not None:
     scene.write(
@@ -167,13 +149,14 @@ if params['skipsteps']==0 and params['output'] is not None:
         save_img(fc.velocity.data[1].data, 100000., thumb_path + "/frcU_{:06d}.png".format(0))
         save_img(fc.velocity.data[0].data, 100000., thumb_path + "/frcV_{:06d}.png".format(0))
 
-sess.initialize_variables()
 for i in range(1, max(params['simsteps']+params['skipsteps'], 1)):
-    my_feed_dict = { tf_st_in: st, tf_fc_in: fc }
-    st, fc = sess.run([tf_st, tf_fc], my_feed_dict)
+    if not params['noforce']:
+        st = simulator.step_with_f(v=st, f=fc, dt=params['dt'])
+    else:
+        st = simulator.step(v=st, dt=params['dt'])
 
     if fc_files is None:
-        forces = sess.run(tf_fcs, {atf_fc_in: force for atf_fc_in, force in zip(tf_fcs_in, forces)})
+        forces = [physics.step(force, dt=params['dt']) for force, physics in zip(forces, force_physics)]
         fc = fc.copied_with(velocity=sum([force.field for force in forces]).at(dm.staggered_grid(0)))
 
     else:
