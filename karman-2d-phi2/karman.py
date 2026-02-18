@@ -72,8 +72,8 @@ class KarmanFlow():
         self.vel_yBc = math.tensor(vel_yBc, shape_v)
         self.vel_yBcMask = math.tensor(np.copy(vel_yBc), shape_v) # warning, only works for 1s, otherwise setup/scale
 
-        self.inflow = self.domain.scalar_grid(Box[5:10, 25:75])         # TODO: scale with domain if necessary!
-        self.obstacles = [Obstacle(Sphere(center=[50, 50], radius=10))] # TODO: scale with domain if necessary!
+        self.inflow = self.domain.scalar_grid(Box['y,x', 5:10, 25:75])  # TODO: scale with domain if necessary!
+        self.obstacles = [Obstacle(Sphere(y=50, x=50, radius=10))] # TODO: scale with domain if necessary!
 
     def step(self, density_in, velocity_in, re, res, dt=1.0, make_input_divfree=False, make_output_divfree=True): #, conserve_density=True):
         velocity = velocity_in
@@ -119,7 +119,7 @@ log.info('torch-{}'.format(torch.__version__))
 if params['output']:
     with open(os.path.normpath(scene.path)+'/params.pickle', 'wb') as f: pickle.dump(params, f)
 
-domain = Domain(y=params['res']*2, x=params['res'], bounds=Box[0:params['len']*2, 0:params['len']], boundaries=OPEN)
+domain = Domain(y=params['res']*2, x=params['res'], bounds=Box['y,x', 0:params['len']*2, 0:params['len']], boundaries=OPEN)
 
 # init density & velocity
 d0 = phi.field.read(params['initdH']).at(domain.scalar_grid()) if params['initdH'] else domain.scalar_grid(0)
